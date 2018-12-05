@@ -1,0 +1,576 @@
+#!/usr/bin/env python
+from __future__ import print_function, division, absolute_import
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import astropy.io.fits as pf
+from astropy.table import Table
+import seaborn as sb
+from glob import glob
+from argparse import ArgumentParser
+from matplotlib.ticker import AutoMinorLocator
+import csv
+import matplotlib.patches as mpatches
+import random
+from os.path import basename
+
+import pixel_time_convert as ptc
+import transit_loc
+from itertools import chain, repeat, islice
+
+from time import time as clock
+
+try:
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    mpi_rank = comm.Get_rank()
+    mpi_size = comm.Get_size()
+    with_mpi = True
+except ImportError:
+    mpi_rank = 0
+    mpi_size = 1
+    with_mpi = False
+ 
+mpi_root = 0
+
+# np.seterr(all='ignore')
+
+#in dir/Users/Nora/Documents/research/TESS/Rel1/data
+# outdir = /Users/Nora/Documents/research/TESS/Rel1/lightcurves/glam_test
+
+# python main_glam.py --lcdir=dir/Users/Nora/Documents/research/TESS/Rel1/data outdir=/Users/Nora/Documents/research/TESS/Rel1/lightcurves/glam_test --binfac=7 --chunks=4 --no-binned
+
+#####################################################
+# This is a standin until we get astroquery working #
+#####################################################
+url = "https://archive.stsci.edu/tess"  # will want to generate a link to the specific star but use this for now
+feedback_range = 40  # change in 2 places....
+# python main.py data data --binfac=7 --chunks=4 --no-binned 
+
+# This code makes 4(?) images out of each lightcurve and saves them as individual subjects. 
+# This is so that the resolution is better for each image - easier to spot single transits (lots in TESS data)
+# Previously there was one manifest input for multiple images - we now need one manifest input (line) for each.
+
+def rebin(arr, new_shape):
+    shape = (new_shape[0], arr.shape[0] // new_shape[0],
+                 new_shape[1], arr.shape[1] // new_shape[1])
+    return arr.reshape(shape).mean(-1).mean(1)
+
+
+def process_lc(lcfile, tics_inj, args):
+
+    feedback_range = 40
+    chunk = (args.tmax + args.overlap * (args.chunks-1)) / float(args.chunks)
+    step = chunk - args.overlap
+
+    # create figure
+    sb.set(style="white", context="paper")
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(12,5))
+    plt.subplots_adjust(left=0.005, right=0.995, top=0.99, bottom=0.01)
+
+    # open the text file with the injected transit data. A file of mostly 0s and a couple of smaller numbers. 
+    # first get the file name  
+    # will need to change for GLAM
+
+    injected_pl = glob("/kepler/kepler2/TESS/ETE-6/injected/Planets/Planets_*{:d}.txt".format(tics_inj))
+    inj_pl = np.genfromtxt(str(injected_pl[0])) 
+
+    # open the LC file and get all the information about the star as usual
+    hdul    = pf.open(lcfile)
+
+    tic_LC     = int(hdul[0].header['TICID'])
+    sec     = int(hdul[0].header['SECTOR'])
+    cam     = int(hdul[0].header['CAMERA'])
+    chi     = int(hdul[0].header['CCD'])
+    tessmag = hdul[0].header['TESSMAG']
+    teff    = hdul[0].header['TEFF']
+    srad    = hdul[0].header['RADIUS']
+
+    scc     = '%02d%1d%1d' % (sec,cam,chi)
+    
+    print('TIC {:9d} SCC {:4s}'.format(tic_LC, scc))   # in the command line print how many files to go
+    
+
+    # make filters for the tic IDs where the SNR is what we want it to be.
+    l_pl1 = np.where(pl['col1'] == tics_inj)[0]               
+    l_eb  = np.where(eb['col1'] == tics_inj)[0]
+
+    data    = hdul[1].data
+    time    = data['TIME']
+    flux    = data['PDCSAP_FLUX']  # the flux LC from the real data
+    qual    = data['QUALITY']
+
+    # --------------------------------------
+    # before you do anything else with the flux of the LC - i.e. before binning and chunking etc, need to inject the transit.
+    flux = inj_pl * flux
+    # --------------------------------------
+
+    hdul.close()
+    t0      = time[0]
+    time    -= t0
+    l       = np.isfinite(time) * np.isfinite(flux) * (qual == 0)
+    time    = time[l]
+    flux    = flux[l]
+    m       = np.median(flux)
+    flux    = 1e2 * ((flux / m) - 1)
+    N       = len(time)
+
+    n       = int(np.floor(N/args.binfac)*args.binfac)
+    X       = np.zeros((2,n))
+    X[0,:]  = time[:n]
+    X[1,:]  = flux[:n]
+    Xb      = rebin(X, (2,int(n/args.binfac)))
+    time1    = Xb[0]
+    flux1    = Xb[1]
+
+    if not args.no_binned:
+        n = int(np.floor(N/args.binfac/10)*args.binfac*10)
+        X = np.zeros((2,n))
+        X[0,:] = time[:n]
+        X[1,:] = flux[:n]
+        Xb = rebin(X, (2,int(n/args.binfac/10)))
+        time2 = Xb[0]
+        flux2 = Xb[1]
+
+
+    # -------------------------------------------------------------------------------------------
+    # loop though each chunk, for each chunk create a new row in the manifest and save one image
+    # i.e. each TIC ID will have 4 manifest inputs
+    # -------------------------------------------------------------------------------------------
+
+    im_name = []
+    xmin_pix = []
+    xmax_pix = []    
+    xmin_time = []
+    xmax_time = []
+
+    feedback           = [ [] for i in range(feedback_range) ]  # for now assume that no LC will have more than 10 transits - may need to change
+    feedback_id        = [ [] for i in range(feedback_range) ]
+    feedback_width     = [ [] for i in range(feedback_range) ]
+    feedback_success   = [ [] for i in range(feedback_range) ]
+    feedback_failure   = [ [] for i in range(feedback_range) ]
+    feedback_tolerance = [ [] for i in range(feedback_range) ]
+
+
+    for j in range(args.chunks):
+        xmin = j * step
+        xmax = xmin + chunk
+        ls1 = (time1 >= xmin) * (time1 <= xmax)  # create a mask for the points that are not within xmin and xmax
+        if not args.no_binned:
+            ls2 = (time2 >= xmin) * (time2 <= xmax)
+        ichunk = j + 1
+
+        ax.cla()  # clear the figure before plotting more data onto it
+
+        nm = 0
+        transit_duration = []
+
+        for l in l_pl1:
+            P = pl['col3'][l]
+            T0 = pl['col4'][l] - t0
+            transit_duration = pl['col9'][l]
+            while T0 < time1[ls1].min():
+                T0 += P
+            while T0 < time1[ls1].max():
+                if not args.no_mark and args.min_snr != None:
+                    plt.axvline(T0,color='red',lw=5,alpha=0.5)
+                nm += 1
+                T0 += P
+
+        for l in l_eb:
+            P = eb['col3'][l]
+            T0 = eb['col4'][l] - t0
+            while T0 < time1[ls1].min():
+                T0 += P
+            while T0 < time1[ls1].max():
+                if not args.no_mark and args.min_snr != None:
+                    plt.axvline(T0,color='yellow',lw=5,alpha=0.5)
+                nm += 1
+                T0 += P
+
+        if nm > 0: # only make figures and save files if there are transits in that chunk 
+
+            # save the file name
+            im_name.append('tess%09d_scc%04s_%02d_%09d_simulated.png' % (tic_LC,scc,ichunk,tics_inj)) # append the name of the image
+
+
+            # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+            # PLOT the image
+            # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    
+            points, = ax.plot(time1[ls1],flux1[ls1], 'w.', markersize=4) # needed to convert into pixels
+    
+            if not args.no_binned:
+                points, = ax.plot(time1[ls1],flux1[ls1],'co') # needed to convert into pixels
+    
+            plt.subplots_adjust(left=0.001, right=0.998, top=0.999, bottom=0.005)
+    
+            # define that length on the x axis - don't want it to display the 0 point
+            ax.set_xlim(xmin, xmax)  
+    
+            # Get the x and y data and transform it into pixel coordinates for the manifest (not sure how useful these will be but store anyway just in case_)
+            x, y = points.get_data()
+            xy_pixels = ax.transData.transform(np.vstack([x,y]).T)
+            xpix, ypix = xy_pixels.T
+    
+            xmin_time.append(xmin)
+            xmax_time.append(xmax)
+    
+            xmin_pix.append(min(xpix))
+            xmax_pix.append(max(xpix)) 
+    
+            delta_flux = np.max(flux1[ls1]) - np.min(flux1[ls1]) 
+    
+            # set the y lim. 
+            percent_change = delta_flux * 0.1  
+            ax.set_ylim(np.min(flux1[ls1]) - percent_change, np.max(flux1[ls1]) + percent_change)  # do we want to change this to be per figure and not per LC? 
+            
+            # label the axis.
+            ax.xaxis.set_label_coords(0.063, 0.06) # position of the x-axis label 
+    
+    
+            # tick mark/axis parameters
+    
+            minorLocator = AutoMinorLocator()
+            ax.xaxis.set_minor_locator(minorLocator)
+            ax.tick_params(direction='in', which ='minor', colors='grey',length=3, labelsize=13)
+    
+            minorLocator = AutoMinorLocator()
+            ax.yaxis.set_minor_locator(minorLocator)
+            ax.tick_params(direction='in', length = 3, which ='minor', colors='grey', labelsize=13)
+    
+            ax.tick_params(axis="y",direction="in", pad= -20)
+            ax.tick_params(axis="x",direction="in", pad= -17)   
+            ax.tick_params(axis='both', length = 7, left='on', top='on', right='on', bottom='on')
+    
+            ax.set_xlabel("DAYS",fontsize = 10)
+            #ax.artists.append(circle1)
+            #ax.artists.append(circle2)
+    
+            #ax.set_axis_bgcolor("#03012d")
+            ax.set_facecolor("#03012d")
+    
+            # save the image - make sure the name of the saved image is the same as the name in the manifest.
+    
+            plt.savefig('%s/%s' % (args.outdir,im_name[-1]), format='png')
+    
+
+            # still for this one chunk, get the feedback information and add to a list
+            # the list will need to have 
+            # get the locations of the transits for the feedback functionality
+        
+            injtrans_pl, injtrans_eb, tic = transit_loc.transit_loc_single(tics_inj, xmin, xmax)
+            transit_duration = ptc.deltat_to_pixel(transit_duration, xmin, xmax)
+            
+            pos_mess = 'Awesome! The green column shows where youve correctly marked a simulated planet transit! A red column means you missed one, but dont be discouraged, some are very difficult, or even impossible, to spot. This can happen when the planet is very small compared to its host star, meaning that the transit is very shallow and easily lost in the varying brightness of the star. Youre doing great, keep going!'
+            neg_mess = 'A green column indicates that youve correctly marked a simulated planet transit! Awesome! A red column means you missed one, but dont be discouraged, some are very difficult, or even impossible, to spot. This can happen when the planet is very small compared to its host star, meaning that the transit is very shallow and easily lost in the varying brightness of the star. Youre doing great, keep going!'
+            
+            # for each feedback we need a list of one entry per chunk
+            for j,trans_loc in enumerate(injtrans_pl):
+                
+                if trans_loc == None: # if no transits exist in that quarter
+
+                    print ("something went wrong") # something should also be present in the LC
+
+                else:
+
+                    trans_loc = [i - transit_duration/48 for i in trans_loc]  # offset the centre by half of the wdith
+                    transit_list = transit_loc.pad(trans_loc, feedback_range, '')  # list of X entries
+                    print(transit_list)
+                    for l,t in enumerate(transit_list):
+                        feedback[l].append(t)
+    
+                        if t != '':
+                            feedback_id[l].append("1111{}".format(l)) 
+                            
+                            if (transit_duration/24) > 13:
+                                feedback_width[l].append(transit_duration/24)  
+                            else:
+                                feedback_width[l].append(13)    
+                            
+                            feedback_success[l].append("{}".format(pos_mess))  
+                            feedback_failure[l].append("{}".format(neg_mess))  
+                                
+                            if (transit_duration/24) > 19.5:
+                                feedback_tolerance[l].append(transit_duration/24*1.5)
+                            else:
+                                feedback_tolerance[l].append(19.5)
+                        else:
+                            feedback_id[l].append(np.nan)
+                            feedback_width[l].append(np.nan)    
+                            feedback_success[l].append(np.nan)  
+                            feedback_failure[l].append(np.nan)  
+                            feedback_tolerance[l].append(np.nan)
+
+
+    mnd = {} # define the dictonary 
+    mnd['Magnitude'] = '{:.2f}'.format(float(tessmag))
+    try:
+        mnd['Temperature'] = '{:d}'.format(int(teff))
+    except:
+        mnd['Temperature'] = None
+    try:
+        mnd['Radius'] = '{:.3f}'.format(float(srad))
+    except:
+        mnd['Radius'] = None
+    mnd['TICID'] = tics_inj
+    mnd['TICLC'] = tic_LC
+    mnd['Sector'] = sec
+    mnd['Web_link'] = url
+    mnd['sim'] = True
+    mnd['im_name'] = im_name
+    mnd['xmin_time'] = xmin_time
+
+    mnd['xmax_time'] = xmax_time
+    mnd['xmin_pix'] = xmin_pix
+    mnd['xmax_pix'] = xmax_pix
+
+    # define the target
+    if tics_inj in pl['col1']:
+        mnd['Target'] = "planet"
+    elif tics_inj in eb['col1']:
+        mnd['Target'] = "EB"
+    else:
+        mnd['Target'] = False
+    
+    # for the feedback, for each 'element' we have a list of 10 lists, each of which has 4 elements
+    # we need to add the feedback to each feedback 'number' to the dictionary 
+    for i in range(0,feedback_range):
+        mnd['feedback{}'.format([i])] =  feedback[i]
+        mnd['feedback_id{}'.format([i])] = feedback_id[i]
+        mnd['feedback_width{}'.format([i])] = feedback_width[i]
+        mnd['feedback_success{}'.format([i])] = feedback_success[i]
+        mnd['feedback_failure{}'.format([i])] = feedback_failure[i]
+        mnd['feedback_tolerance{}'.format([i])] = feedback_tolerance[i]
+
+    return mnd        
+
+# calculate the SNR
+def SNR(pl_tic, lcfile):
+    
+    plt_tic = pl[(pl['col1'] == pl_tic)][0]
+    
+    pl_depth = plt_tic['col10']
+    pl_dur = plt_tic['col9']
+
+    durs = np.array([0.5, 1, 2])
+    durs_ = np.array(['0_5', '1_0', '2_0'])
+    pl_cdpp = 0
+    
+    # get the information of the LC
+    hdul = pf.open(lcfile)
+    hdr = hdul[1].header
+    j = np.argmin(abs(pl_dur - durs))
+    pl_cdpp = float(hdr['CDPP' + durs_[j]])
+    hdul.close()
+
+    pl_snr = pl_depth / pl_cdpp
+    
+    return pl_snr
+
+
+if __name__ == '__main__':
+    ap = ArgumentParser(description='Script to pLot TESS LCs for Zooniverse project')
+    ap.add_argument('--lcdir', type=str, help='Directory containing input light curve files.', 
+        default='/kepler/kepler2/TESS/ETE-6/light_curves/two_min/')
+    ap.add_argument('--outdir', type=str, help='Directory to place output PNG files in.',
+        default='/kepler/kepler2/TESS/planethunters/Rel01/LC_simulated')
+    ap.add_argument('--binfac', type=int, help='Binning factor', default=3)
+    ap.add_argument('--chunks', type=int, help='Chunks per sector', default=1)
+    ap.add_argument('--overlap', type=float, help='Overlap between chunks (in days)', default=1.0)
+    ap.add_argument('--tmax', type=float, help='Total duration of sector', default=27.8)
+    ap.add_argument('--no-binned', action='store_true')
+    ap.add_argument('--no-mark', action='store_true')
+    ap.add_argument('--min-snr', type=float, help='min. SNR of transit/eclipse to mark', default=0.5)  # CHANGE THIS LATER
+    ap.add_argument('--number', type=int, help='The number of randomly selected subjects (default all in outdir folder)', default=None)
+
+    seed_num = 4 # the set of random samples #use seed =2 for the current images on zooniverse
+
+    args = ap.parse_args()
+
+    # import these tables - the planet table contains the SNR, which is good to make sure that the planets have an OK SNR
+
+    # CHANGE ON GLAM
+    eb = Table.read('/kepler/kepler2/TESS/ETE-6/injected/ete6_eb_data.txt', format='ascii',comment='#')
+    pl = Table.read('/kepler/kepler2/TESS/ETE-6/injected/ete6_planet_data.txt', format='ascii',comment='#')
+
+    ## Master node
+    ## -----------
+    # get list of all the real LC and choose how many to edit random selection
+    if mpi_rank == mpi_root:
+        t0 = clock()
+
+        # get list of all the real LC and choose how many to edit - random selection
+        lcfile0 = sorted(glob('{:s}/tess*lc.fits'.format(args.lcdir)))
+        if args.number != None: # randomly select the targets
+            random.seed(seed_num)  # the ETE-6 data were all created with seed = 1. The images for examples with seed=7, 9
+            random.shuffle(lcfile0)
+            lcfile0 = lcfile0[:args.number]
+            nlc = len(lcfile0)
+        # now choose random tic values from the injected planet list.
+        tics_inj = np.unique(pl['col1'].flatten())
+        if args.number != None: # randomly select the planet targets to inject
+            random.seed(seed_num)
+            random.shuffle(tics_inj)
+            tics_inj = list(tics_inj[:args.number])
+
+
+        # get the names of the feedback columns
+        feedback_name = []
+
+        for i in range (feedback_range):
+            feedback_name.append("#feedback_{}_x".format(i))
+            feedback_name.append("#feedback_{}_id".format(i))
+            feedback_name.append('#feedback_{}_width'.format(i))
+            feedback_name.append('#feedback_{}_successMessage'.format(i))
+            feedback_name.append('#feedback_{}_failureMessage'.format(i))
+            feedback_name.append('#feedback_{}_tolerance'.format(i))
+
+
+        meta_names = ["#Image", "Magnitude","Temperature (K)", "Radius (solar radii)", "#Target", "!TIC ID", "Sector", "!Web_link", "#xmin_pix", "#xmax_pix", "#xmin_time", "#xmax_time", "#sim", '#TIC LC']
+        metadata_header = (meta_names + feedback_name)
+        
+        
+        with open('%s/manifest.csv' % (args.outdir), 'w') as f: # save in the photometry folder
+            writer = csv.writer(f, delimiter=',')
+            writer.writerow(metadata_header)
+
+
+        ## Without MPI or running with a single node
+        ## =========================================
+        if (not with_mpi) or (mpi_size==1) or (nlc==1):
+            #print ('processing {:d} LCs'.format(nlc))
+            for i,f in enumerate(lcfile0):
+                pl_tic = tics_inj[i]
+                print ('processing TIC {}'.format(int(basename(f).split('-')[1])))
+ 
+                snr_LC = SNR(pl_tic,f)
+
+                if snr_LC > args.min_snr:
+                    res = process_lc(f, pl_tic, args)
+
+                    with open('%s/manifest.csv' % (args.outdir), 'a') as f: # save in the photometry folder
+                        writer = csv.writer(f, delimiter=',')
+    
+                        for ichunk in range(len(res['im_name'])):
+    
+                            metadata_data = [res['im_name'][ichunk]]
+                            metadata_data.append(res['Magnitude'])
+                            metadata_data.append(res['Temperature'])
+                            metadata_data.append(res['Radius'])
+                            metadata_data.append(res['Target'])
+                            metadata_data.append(res['TICID'])
+                            metadata_data.append(res['Sector'])
+                            metadata_data.append(res['Web_link'])
+                            metadata_data.append(res['xmin_pix'][ichunk])
+                            metadata_data.append(res['xmax_pix'][ichunk])
+                            metadata_data.append(res['xmin_time'][ichunk])
+                            metadata_data.append(res['xmax_time'][ichunk])
+                            metadata_data.append(res['sim'])
+                            metadata_data.append(res['TICLC'])
+    
+                            for i in range(0,10):
+                                metadata_data.append(res['feedback{}'.format([i])][ichunk])
+                                metadata_data.append(res['feedback_id{}'.format([i])][ichunk])
+                                metadata_data.append(res['feedback_width{}'.format([i])][ichunk])
+                                metadata_data.append(res['feedback_success{}'.format([i])][ichunk])
+                                metadata_data.append(res['feedback_failure{}'.format([i])][ichunk])
+                                metadata_data.append(res['feedback_tolerance{}'.format([i])][ichunk])
+    
+                            writer.writerow(metadata_data) 
+
+        else:
+            ## Master node
+            ## -----------
+            if mpi_rank == 0:
+                free_workers = list(range(1,mpi_size))
+                active_workers = []
+                n_finished_items = 0
+
+                while lcfile0 or active_workers:
+                    ## Send a file
+                    while lcfile0 and free_workers:
+                        w = free_workers.pop()
+                        f = lcfile0.pop()
+                        tic = tics_inj.pop()
+
+                        print ('Sending TIC {} to worker {}'.format(int(basename(f).split('-')[1]), w))
+                        comm.send(f, dest=w, tag=0)
+                        comm.send(tic, dest=w, tag=1)
+                        active_workers.append(w)
+                    
+                    ## Receive the results
+                    for w in active_workers:
+                        if comm.Iprobe(w, 2):
+                            res = comm.recv(source=w, tag=2)
+
+                            print ('Worker {} finished processing TIC {}'.format(w, res['TICID']))
+                            with open('%s/manifest.csv' % (args.outdir), 'a') as f: # save in the photometry folder
+                                
+                                writer = csv.writer(f, delimiter=',')
+                                for ichunk in range(len(res['im_name'])):
+                                    metadata_data = [res['im_name'][ichunk]]
+                                    metadata_data.append(res['Magnitude'])
+                                    metadata_data.append(res['Temperature'])
+                                    metadata_data.append(res['Radius'])
+                                    metadata_data.append(res['Target'])
+                                    metadata_data.append(res['TICID'])
+                                    metadata_data.append(res['Sector'])
+                                    metadata_data.append(res['Web_link'])
+                                    metadata_data.append(res['xmin_pix'][ichunk])
+                                    metadata_data.append(res['xmax_pix'][ichunk])
+                                    metadata_data.append(res['xmin_time'][ichunk])
+                                    metadata_data.append(res['xmax_time'][ichunk])
+                                    metadata_data.append(res['sim'])
+                                    metadata_data.append(res['TICLC'])
+            
+                                    for i in range(0,feedback_range):
+                                        metadata_data.append(res['feedback{}'.format([i])][ichunk])
+                                        metadata_data.append(res['feedback_id{}'.format([i])][ichunk])
+                                        metadata_data.append(res['feedback_width{}'.format([i])][ichunk])
+                                        metadata_data.append(res['feedback_success{}'.format([i])][ichunk])
+                                        metadata_data.append(res['feedback_failure{}'.format([i])][ichunk])
+                                        metadata_data.append(res['feedback_tolerance{}'.format([i])][ichunk])
+            
+                                    writer.writerow(metadata_data) 
+
+                            free_workers.append(w)
+                            active_workers.remove(w)
+                            n_finished_items += 1
+
+                print ('Completed {} of {} files'.format(n_finished_items,nlc))
+                if n_finished_items < nlc:
+                    print ('Failed on {} files'.format(nlc-n_finished_items))
+                for w in free_workers:
+                    comm.send(-1, dest=w, tag=0)
+                t1 = clock()
+                print('Time taken: {}'.format(t1-t0))
+
+    ## Worker node
+    ## -----------
+    else:
+        while True:
+            filename = comm.recv(source=mpi_root, tag=0)
+            tics = comm.recv(source=mpi_root, tag=1)
+
+            if filename == -1:
+                break
+
+
+            snr_LC = SNR(tics,filename)
+
+            if snr_LC > args.min_snr:
+                res = process_lc(filename, tics, args)
+                comm.send(res, dest=mpi_root, tag=2)
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,12 @@
+module load python/3.6.3-gcc
+/usr/local/shared/python/3.6.3/bin/python3 /users/nora/soft/PH_make_LC3/main_glam_split.py --binfac=7 --chunks=4 --no-binned --ifrom=0 --ito=10 --section=1
+module load python/3.6.3-gcc
+/usr/local/shared/python/3.6.3/bin/python3 /users/nora/soft/PH_make_LC3/main_glam_split.py --binfac=7 --chunks=4 --no-binned --ifrom=10 --ito=20 --section=1
+module load python/3.6.3-gcc
+/usr/local/shared/python/3.6.3/bin/python3 /users/nora/soft/PH_make_LC3/main_glam_split.py --binfac=7 --chunks=4 --no-binned --ifrom=20 --ito=30 --section=1
+module load python/3.6.3-gcc
+/usr/local/shared/python/3.6.3/bin/python3 /users/nora/soft/PH_make_LC3/main_glam_split.py --binfac=7 --chunks=4 --no-binned --ifrom=30 --ito=40 --section=1
+module load python/3.6.3-gcc
+/usr/local/shared/python/3.6.3/bin/python3 /users/nora/soft/PH_make_LC3/main_glam_split.py --binfac=7 --chunks=4 --no-binned --ifrom=40 --ito=50 --section=1
+module load python/3.6.3-gcc
+/usr/local/shared/python/3.6.3/bin/python3 /users/nora/soft/PH_make_LC3/main_glam_split.py --binfac=7 --chunks=4 --no-binned --ifrom=50 --ito=60 --section=1

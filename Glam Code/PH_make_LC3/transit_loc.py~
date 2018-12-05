@@ -1,0 +1,117 @@
+from astropy.table import Table
+import numpy as np
+from glob import glob
+import astropy.io.fits as pf
+import pixel_time_convert as ptc
+
+from itertools import chain, repeat, islice
+
+
+def transit_loc_single(tic, snr, xmin, xmax):
+
+	'''
+	This function returns the tic ID with the locations of the transits for the EB and the planets. 
+
+	input
+	----
+	data (DF): list of all the tics
+	snr: the threshhold snr ratio, default = 0
+	xmin (float) : if a chunk is defined, it will only locate the transits within that chunk, if nothing is defined, it will assume that the whole LC should be cosidered.
+	xmax (float) : if a chunk is defined, it will only locate the transits within that chunk, if nothing is defined, it will assume that the whole LC should be cosidered.
+
+	output:
+	----
+	Panda Data frame of TIC_ID, time (in days) of planet transits and of EB transits. The TIC ID are the indexes of the DF so that they can be easily acessed.
+	'''
+	
+	eb = Table.read('/kepler/kepler2/TESS/ETE-6/injected/ete6_eb_data.txt', format='ascii',comment='#')
+	pl = Table.read('/kepler/kepler2/TESS/ETE-6/injected/ete6_planet_data.txt', format='ascii',comment='#')
+
+	injtrans_pl = []
+	injtrans_eb = []
+
+	if tic in pl['col1']:
+		lcfile  = np.sort(glob("/kepler/kepler2/TESS/ETE-6/light_curves/two_min/tess*{:d}*.fits".format(tic)))
+	
+		lcfile = lcfile[0]
+		hdul    = pf.open(lcfile)
+	
+		data    = hdul[1].data
+		flux    = data['PDCSAP_FLUX']
+		qual    = data['QUALITY']
+		time    = data['TIME']
+		hdul.close()
+		t0      = time[0]
+		time    -= t0
+		l       = np.isfinite(time) * np.isfinite(flux) * (qual == 0)
+		time    = time[l]
+		
+		l_pl1 = np.where((pl['col1'] == tic) * (pl['col16'] >= snr))[0] 
+	
+		transit_loc_TIC = []
+	
+		for l in l_pl1:
+			P = pl['col3'][l]
+			T0 = pl['col4'][l] - t0
+			while T0 < xmin:
+				T0 += P
+			while T0 < xmax:
+				transit_loc_TIC.append(T0)
+				T0 += P
+		
+		injtrans_pl.append(ptc.time_to_pixel(transit_loc_TIC, xmin, xmax))
+	
+	# same for the EB
+	if tic in eb['col1']:
+		lcfile  = np.sort(glob("/kepler/kepler2/TESS/ETE-6/light_curves/two_min/tess*{:d}*.fits".format(tic)))
+	
+		lcfile = lcfile[0]
+		hdul    = pf.open(lcfile)
+	
+		data    = hdul[1].data
+		flux    = data['PDCSAP_FLUX']
+		qual    = data['QUALITY']
+		time    = data['TIME']
+		hdul.close()
+		t0      = time[0]
+		time    -= t0
+		l       = np.isfinite(time) * np.isfinite(flux) * (qual == 0)
+		time    = time[l]
+		
+		l_eb1 = np.where(eb['col1'] == tic)[0]
+	
+		transit_loc_TIC = []
+	
+		for l in l_eb1:
+			P = eb['col3'][l]
+			T0 = eb['col4'][l] - t0
+			while T0 < xmin:
+				T0 += P
+			while T0 < xmax:
+				transit_loc_TIC.append(T0)
+				T0 += P
+		
+		injtrans_eb.append(ptc.time_to_pixel(transit_loc_TIC, xmin, xmax))
+
+
+	if tic in pl['col1'] and tic not in eb['col1']:
+		injtrans_eb.append(None)
+
+	if tic in eb['col1'] and tic not in pl['col1']:
+		injtrans_pl.append(None)
+
+	if tic not in pl['col1'] and tic not in eb['col1']:
+		injtrans_pl.append(None)
+		injtrans_eb.append(None)
+
+	#transit_locs_DF = pd.DataFrame({'injtrans_pl': injtrans_pl,'injtrans_eb': injtrans_eb}, index = tic)
+		
+	return injtrans_pl, injtrans_eb, tic
+
+
+def pad_infinite(iterable, padding=None):
+    return chain(iterable, repeat(padding))
+
+def pad(iterable, size, padding=None):
+    return islice(pad_infinite(iterable, padding), size)
+    
